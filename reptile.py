@@ -16,10 +16,11 @@ class DB:
         # 建立连接
         self.db_connect = MongoClient('mongodb://%s:%s@%s' % (usr, passwd, ip))
         self.using_db = 0
+    # 1. 清除残留数据
     def clear(self):
-        # 清除残留数据
         self.db_connect['DataByJob'].command("dropDatabase")
         self.db_connect['DataByCity'].command("dropDatabase")
+    # 2. 保存数据
     def save(self, db_name, col_name, save_data):
         time_start = time.time()
         self.db_connect[db_name][col_name
@@ -28,14 +29,11 @@ class DB:
         time_stop = time.time()
         print('data saved, %s sec used' % (time_stop - time_start))
         return 0
-    def load(self, db_name, col_name):
-        return_list = []
-        for data in self.db_connect[db_name][col_name.replace('.', '[point]')
-                .replace(' ', '[empty]')
-        ].find({}, {"_id": 0}):
-            return_list.append(data)
-        return return_list
-    def search(self):
+    # 3. 获取供前端直接调用的数据
+    def get_second_layer_db_data(self):
+        return self.db_connect["data-informations"]["data-informations"].find_one({}, {"_id": 0})
+    # 4. 生成供前端直接调用的数据
+    def generate_second_layer_db(self):
         jobs_num_per_city = {}
         company_name_count = {}
         avg_salary_per_city = {}
@@ -68,10 +66,12 @@ class DB:
                 else:
                     experiment_requirments[city_str['workYear']] += 1
                 # 1.5 行业领域
-                if city_str['industryField'] not in industry_field.keys():
-                    industry_field[city_str['industryField']] = 1
-                else:
-                    industry_field[city_str['industryField']] += 1
+                for industryField in re.split(',', city_str['industryField']):
+                    industryField = re.sub(r'丨', "与", industryField)
+                    if industryField not in industry_field.keys():
+                        industry_field[industryField] = 1
+                    else:
+                        industry_field[industryField] += 1
 
         # 2. 获取每个城市的平均薪资
         for city in self.db_connect['DataByCity'].list_collection_names():
@@ -90,15 +90,24 @@ class DB:
         return_dict['学历要求'] = educational_requirements
         return_dict['工作经验要求'] = experiment_requirments
         return_dict['行业领域'] = industry_field
+        return_dict['数据更新时间'] = time.strftime('%Y-%m-%d %H:%M:%S')
 
-        return return_dict
+        # 3. 保存数据
+        self.db_connect['data-informations']['data-informations'].drop()
+        self.db_connect["data-informations"]["data-informations"].insert_one(return_dict)
+
+        return 0
 
 
 class GetDataByJob:
     # 初始化参数：工作列表，初始化后的数据库类
-    def __init__(self, DB):
+    def __init__(self, DB, job_name_list = []):
         self.DB = DB
-        self.job_all, self.job_list = self.get_job_names()
+        if job_name_list:
+            self.job_list = job_name_list
+            self.job_all = {}
+        else:
+            self.job_all, self.job_list = self.get_job_names()
         # 第一次请求的URL
         self.first_url = 'https://www.lagou.com/jobs/list_Java?px=new&city=%E5%85%A8%E5%9B%BD#order'
         # 第二次请求的URL
@@ -122,7 +131,6 @@ class GetDataByJob:
             'X-Requested-With': 'XMLHttpRequest'
         }
     # 获取工作名称列表
-    # 作者：李昶
     def get_job_names(self):
         url = "https://www.lagou.com/"
         r = requests.get(url, headers={
@@ -154,7 +162,7 @@ class GetDataByJob:
     def save_to_db(self, job_name, input_list):
         self.DB.save('DataByJob', job_name, input_list)
     def save_update_time(self):
-        self.DB.save('DataByJob', 'update-time', time.strftime('%Y-%m-%d %H:%M:%S'))
+        self.DB.save('DataByJob', 'update-time', time.strftime('%Y-%m-%d %H'))
     def run(self):
         # 创建一个session对象
         session = requests.session()
@@ -209,9 +217,13 @@ class GetDataByJob:
 
 
 class GetDataByCity:
-    def __init__(self, DB):
+    def __init__(self, DB, city_name_list = []):
         self.DB = DB
-        self.city_list = self.get_city_names()
+        if city_name_list:
+            self.city_list = city_name_list
+            self.job_all = {}
+        else:
+            self.city_list = self.get_city_names()
         self.first_url = 'https://www.lagou.com/jobs/list_Java?px=new&city=%E5%85%A8%E5%9B%BD#order'
         self.second_url = 'https://www.lagou.com/jobs/positionAjax.json?needAddtionalResult=false'
         self.headers = {
@@ -312,7 +324,6 @@ class LocalAPI(threading.Thread):
         self.DB = DB
 
     def run(self):
-        time.sleep(10)
         app = Flask(__name__)
         MY_URL = '/2-204/'
         # 获取：城市数据，职业数据，等等等等
@@ -320,19 +331,25 @@ class LocalAPI(threading.Thread):
         def request_all():
             print('request received')
             if self.DB.using_db == 1:
-                return_dict = {'msg': '数据库更新中，请稍后再试'}
-                return json.dumps(return_dict, cls=DateEncoder, ensure_ascii=False)
+                return json.dumps({'msg': '数据库更新中，请稍后再试'}, ensure_ascii=False)
             else:
-                return_dict = self.DB.search()
-                for i in return_dict:
-                    print('%s : %s'%(i, return_dict[i]))
-                return json.dumps(return_dict, cls=DateEncoder, ensure_ascii=False)
+                return_dict = self.DB.get_second_layer_db_data()
+                if not bool(return_dict):
+                    return json.dumps({'msg': '数据爬取中，请稍后再试'}, ensure_ascii=False)
+                else:
+                    return json.dumps(return_dict, cls=DateEncoder, ensure_ascii=False)
         app.run(threaded=True, processes=True, host='0.0.0.0', port=5000, debug=True, use_reloader=False)
 
 class MainExecution(threading.Thread):
-    def __init__(self, DB):
+    def __init__(self, DB, test_data = {}):
         threading.Thread.__init__(self)
         self.DB = DB
+        self.job_name_list = []
+        self.city_name_list = []
+        if type(test_data) == dict and bool(test_data):
+            self.job_name_list = test_data['job names']
+            self.city_name_list = test_data['city names']
+
     def run(self):
         running_first_time = 1
         while 1:
@@ -347,24 +364,31 @@ class MainExecution(threading.Thread):
                     self.get_data()
                 time.sleep(3600)
     def get_data(self):
-        # 加锁
-        self.DB.using_db = 1
         # 清空数据库
         self.DB.clear()
         # 获取职业数据
-        GDBJ = GetDataByJob(self.DB)
+        GDBJ = GetDataByJob(self.DB, self.job_name_list)
         GDBJ.run()
         # 获取城市数据
-        GDBC = GetDataByCity(self.DB)
+        GDBC = GetDataByCity(self.DB, self.city_name_list)
         GDBC.run()
+        # 加锁
+        self.DB.using_db = 1
+        # 进行数据清洗，为前端准备数据
+        self.DB.generate_second_layer_db()
         # 解锁
         self.DB.using_db = 0
 
 
 if __name__ == '__main__':
-    usr = '********'
-    passwd = '******************************************'
+    usr = 'xxxxxxxxxxxxxxxxxxxx'
+    passwd = '***************************************'
     ip = 'xxx.xxx.xxx.xxx'
+
+    # 用于测试
+    test_data = {}
+    test_data['job names'] = ['Java', 'C++', 'Python', 'Go']
+    test_data['city names'] = ['北京', '广州', '深圳', '上海']
 
     DataBase = DB(usr, passwd, ip)
 
