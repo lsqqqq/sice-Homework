@@ -4,9 +4,11 @@
 import requests
 import random
 from pymongo import MongoClient
+from dateutil import parser
 import json, time, datetime
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
 import re
 import numpy as np
 import threading
@@ -23,9 +25,13 @@ class DB:
     # 2. 保存数据
     def save(self, db_name, col_name, save_data):
         time_start = time.time()
-        self.db_connect[db_name][col_name
-            .replace('.', '[point]')
-            .replace(' ', '[empty]')].insert_many(save_data)
+        col_name_for_save = col_name.replace('.', '[point]').replace(' ', '[empty]')
+        # 把字符串格式的日期转换为mongodb存储的isoDate格式
+        for data in save_data:
+            data["createTime"] = parser.parse(data["createTime"])
+        # 创建索引并存入数据
+        self.db_connect[db_name][col_name_for_save].create_index([("createTime", -1), ("salary", -1)])
+        self.db_connect[db_name][col_name_for_save].insert_many(save_data)
         time_stop = time.time()
         print('data saved, %s sec used' % (time_stop - time_start))
         return 0
@@ -40,6 +46,7 @@ class DB:
         educational_requirements = {}
         experiment_requirments = {}
         industry_field = {}
+        latest_recruitment_information = {}
         # 1. 获取不同城市的招聘数量等
         for job in self.db_connect['DataByJob'].list_collection_names():
             for city_str in self.db_connect['DataByJob'][job].find({}, {"city": 1, "companyShortName": 1,
@@ -51,10 +58,11 @@ class DB:
                 else:
                     jobs_num_per_city[city_str['city']] += 1
                 # 1.2 每个公司的招聘数量
-                if city_str['companyShortName'] not in company_name_count.keys():
-                    company_name_count[city_str['companyShortName']] = 1
+                company_name = re.sub(' ', '', re.sub('\\.', '', city_str['companyShortName']))
+                if company_name not in company_name_count.keys():
+                    company_name_count[company_name] = 1
                 else:
-                    company_name_count[city_str['companyShortName']] += 1
+                    company_name_count[company_name] += 1
                 # 1.3 学历要求
                 if city_str['education'] not in educational_requirements.keys():
                     educational_requirements[city_str['education']] = 1
@@ -66,38 +74,55 @@ class DB:
                 else:
                     experiment_requirments[city_str['workYear']] += 1
                 # 1.5 行业领域
-                for industryField in re.split(',', city_str['industryField']):
-                    industryField = re.sub(r'丨', "与", industryField)
-                    if industryField not in industry_field.keys():
-                        industry_field[industryField] = 1
-                    else:
-                        industry_field[industryField] += 1
+                if bool(city_str['industryField']):
+                    for industryField in re.split('[,、， ]', city_str['industryField']):
+                        industryField = re.sub(r'\\.', '', re.sub(r'丨', "与", industryField))
+                        if industryField not in industry_field.keys():
+                            industry_field[industryField] = 1
+                        else:
+                            industry_field[industryField] += 1
 
-        # 2. 获取每个城市的平均薪资
+        # 2. 获取每个城市的平均薪资以及最新招聘信息
         for city in self.db_connect['DataByCity'].list_collection_names():
             city_name = city.replace('[point]', '.') \
                 .replace('[empty]', ' ')
+            # 2.1 获取每个城市的平均薪资
             salary_list = []
-            for salary_str in self.db_connect['DataByCity'][city].find({}, {"salary": 1}):
+            for salary_str in self.db_connect['DataByCity'][city].find({}, {"salary": 1, "_id": 0}):
                 low_salary, high_salary = re.split('-', salary_str['salary'])
                 salary_list.append((int(re.sub(r'\D', "", low_salary)) + int(re.sub(r'\D', "", high_salary)))/2)
             avg_salary_per_city[city_name] = np.round(np.mean(salary_list), 1)
 
+            # 2.2 获取最新招聘信息
+            latest_dates = list(self.db_connect['DataByCity'][city].find({}, {"createTime": 1, "_id": 0})
+                                .sort([{"createTime", -1}]).limit(1))
+            latest_recruitment_information[city_name] = \
+                self.db_connect['DataByCity'][city].find_one({"createTime":latest_dates[0]["createTime"]}, {"_id": 0})
+
+        # # 3. 获取最新招聘信息(仅大城市）
+        # for city in ['北京', '上海', '广州', '深圳', '成都']:
+        #     latest_dates = list(self.db_connect['DataByCity'][city].find({}, {"createTime": 1, "_id": 0})
+        #                         .sort([{"createTime", -1}]).limit(1))
+        #     latest_recruitment_information[city] = \
+        #         self.db_connect['DataByCity'][city].find_one({"createTime": latest_dates[0]["createTime"]},
+        #                                                      {"_id": 0})
+
+
         return_dict = {}
-        return_dict['各城市岗位需求'] = jobs_num_per_city
-        return_dict['各城市平均工资'] = avg_salary_per_city
-        return_dict['各公司招聘数量'] = company_name_count
-        return_dict['学历要求'] = educational_requirements
-        return_dict['工作经验要求'] = experiment_requirments
-        return_dict['行业领域'] = industry_field
-        return_dict['数据更新时间'] = time.strftime('%Y-%m-%d %H:%M:%S')
+        return_dict['各城市岗位需求'] = dict(sorted(jobs_num_per_city.items(), reverse = True, key = lambda kv:kv[1]))
+        return_dict['各城市平均工资'] = dict(sorted(avg_salary_per_city.items(), reverse = True, key = lambda kv:kv[1]))
+        return_dict['各公司招聘数量'] = dict(sorted(company_name_count.items(), reverse = True, key = lambda kv:kv[1]))
+        return_dict['学历要求'] = dict(sorted(educational_requirements.items(), reverse = True, key = lambda kv:kv[1]))
+        return_dict['工作经验要求'] = dict(sorted(experiment_requirments.items(), reverse = True, key = lambda kv:kv[1]))
+        return_dict['行业领域'] = dict(sorted(industry_field.items(), reverse = True, key = lambda kv:kv[1]))
+        return_dict['最新招聘信息'] = latest_recruitment_information
+        return_dict['数据更新时间'] = time.strftime('%Y-%m-%d %H')
 
         # 3. 保存数据
         self.db_connect['data-informations']['data-informations'].drop()
         self.db_connect["data-informations"]["data-informations"].insert_one(return_dict)
 
         return 0
-
 
 class GetDataByJob:
     # 初始化参数：工作列表，初始化后的数据库类
@@ -325,6 +350,7 @@ class LocalAPI(threading.Thread):
 
     def run(self):
         app = Flask(__name__)
+        CORS(app, resources=r'/*')  # 让本服务器所有的URL都允许跨域请求
         MY_URL = '/2-204/'
         # 获取：城市数据，职业数据，等等等等
         @app.route(MY_URL + 'request-all', endpoint='request-all', methods=['GET'])
@@ -333,7 +359,9 @@ class LocalAPI(threading.Thread):
             if self.DB.using_db == 1:
                 return json.dumps({'msg': '数据库更新中，请稍后再试'}, ensure_ascii=False)
             else:
+                time_start = time.time()
                 return_dict = self.DB.get_second_layer_db_data()
+                print('%s seconds using for checking data'%str(time.time() - time_start))
                 if not bool(return_dict):
                     return json.dumps({'msg': '数据爬取中，请稍后再试'}, ensure_ascii=False)
                 else:
@@ -381,14 +409,9 @@ class MainExecution(threading.Thread):
 
 
 if __name__ == '__main__':
-    usr = 'xxxxxxxxxxxxxxxxxxxx'
-    passwd = '***************************************'
+    usr = 'xxxxx'
+    passwd = 'xxxxx'
     ip = 'xxx.xxx.xxx.xxx'
-
-    # 用于测试
-    test_data = {}
-    test_data['job names'] = ['Java', 'C++', 'Python', 'Go']
-    test_data['city names'] = ['北京', '广州', '深圳', '上海']
 
     DataBase = DB(usr, passwd, ip)
 
@@ -397,4 +420,3 @@ if __name__ == '__main__':
 
     thread_MainExecution.start()
     thread_LocalAPI.start()
-
